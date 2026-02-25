@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Limit Render
 // @namespace    https://github.com/hu-qihang/chatgpt-limit-render
-// @version      0.5.0
-// @description  解决 ChatGPT 网页端卡顿问题
+// @version      0.6.0
+// @description  解决 ChatGPT 网页端卡顿问题，提供现代化云母 UI 与更稳定的对话裁剪逻辑
 // @match        https://chatgpt.com/*
 // @run-at       document-idle
 // @grant        none
@@ -12,9 +12,10 @@
 (function() {
   'use strict';
 
-  // 防重入
-  if (window.__LR_V5__) return;
-  window.__LR_V5__ = true;
+  if (window.__LR_V6__) return;
+  window.__LR_V6__ = true;
+
+  const STORAGE_KEY = 'lr-v6-settings';
 
   const CONFIG = {
     enabled: true,
@@ -24,29 +25,73 @@
     freezeGuard: true,
     restoreDelay: 1500,
     freezeThreshold: 3500,
-    maxCache: 50
+    maxCache: 80,
+    pulseIntensity: 1
   };
 
   const STATE = {
-    mode: 'default', // default, safe, disabled
+    mode: 'default',
     streaming: false,
     applying: false,
-    expanded: false
+    expanded: false,
+    mounted: false,
+    hiddenCount: 0
   };
 
-  const CACHE = { d: new Map(), o: [] };
+  const CACHE = {
+    d: new Map(),
+    o: []
+  };
 
-  const log = CONFIG.debug ? console.log : () => {};
+  let restoreTimer;
 
-  // ==================== 核心逻辑 (保持不变) ====================
-  
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function saveSettings() {
+    const payload = {
+      enabled: CONFIG.enabled,
+      defaultTurns: CONFIG.defaultTurns,
+      safeTurns: CONFIG.safeTurns,
+      preSendAuto: CONFIG.preSendAuto,
+      freezeGuard: CONFIG.freezeGuard,
+      restoreDelay: CONFIG.restoreDelay,
+      freezeThreshold: CONFIG.freezeThreshold,
+      pulseIntensity: CONFIG.pulseIntensity
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  }
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const cfg = JSON.parse(raw);
+      if (!cfg || typeof cfg !== 'object') return;
+
+      CONFIG.enabled = cfg.enabled !== false;
+      CONFIG.defaultTurns = clamp(Number(cfg.defaultTurns) || 15, 1, 200);
+      CONFIG.safeTurns = clamp(Number(cfg.safeTurns) || 6, 1, 50);
+      CONFIG.preSendAuto = cfg.preSendAuto !== false;
+      CONFIG.freezeGuard = cfg.freezeGuard !== false;
+      CONFIG.restoreDelay = clamp(Number(cfg.restoreDelay) || 1500, 200, 10000);
+      CONFIG.freezeThreshold = clamp(Number(cfg.freezeThreshold) || 3500, 500, 30000);
+      CONFIG.pulseIntensity = clamp(Number(cfg.pulseIntensity) || 1, 0.2, 2);
+    } catch {
+      // 忽略无效配置
+    }
+  }
+
   function getTurns() {
     try {
-      let n = document.querySelectorAll('[data-testid="conversation-turn"]');
-      if (n.length) return [...n];
-      const m = document.querySelector('main');
-      return m ? [...document.querySelectorAll('article', m)] : [];
-    } catch { return []; }
+      const direct = document.querySelectorAll('[data-testid="conversation-turn"]');
+      if (direct.length) return [...direct];
+      const main = document.querySelector('main');
+      return main ? [...main.querySelectorAll('article')] : [];
+    } catch {
+      return [];
+    }
   }
 
   function ensureId(el) {
@@ -55,84 +100,123 @@
   }
 
   function cacheSet(id, node, parent, next) {
-    if (CACHE.d.size >= CONFIG.maxCacheSize && CACHE.o.length) {
+    if (!id || !node || !parent) return;
+
+    if (CACHE.d.has(id)) {
+      const idx = CACHE.o.indexOf(id);
+      if (idx >= 0) CACHE.o.splice(idx, 1);
+    }
+
+    while (CACHE.d.size >= CONFIG.maxCache && CACHE.o.length) {
       CACHE.d.delete(CACHE.o.shift());
     }
+
     CACHE.d.set(id, { n: node, p: parent, x: next });
     CACHE.o.push(id);
   }
 
+  function createPlaceholder(id, index) {
+    const ph = document.createElement('div');
+    ph.className = 'lr-ph';
+    ph.dataset.lrTarget = id;
+    ph.innerHTML = `<span>对话 ${index + 1}</span><button class="lr-pb">展开</button>`;
+    return ph;
+  }
+
   function applyLimit(count) {
-    if (STATE.applying || !CONFIG.enabled) return;
+    if (STATE.applying) return;
+    if (!CONFIG.enabled) {
+      updateStatus('已关闭');
+      return;
+    }
+
     STATE.applying = true;
-    
     try {
       const turns = getTurns();
-      if (!turns.length) return;
-      
-      turns.forEach(ensureId);
-      document.querySelectorAll('.lr-ph').forEach(ph => {
-        const id = ph.dataset.lrTarget;
-        const t = document.querySelector(`[data-lr-id="${CSS.escape(id)}"]`);
-        if (t && !t.dataset.lrPin && t.isConnected) ph.remove();
-      });
-
-      const keep = Math.max(1, Math.min(count, 200));
-      const hide = turns.length - keep;
-      if (hide <= 0) { updateStatus(`全部 ${turns.length} 轮`); return; }
-
-      let h = 0;
-      for (let i = 0; i < hide; i++) {
-        const t = turns[i];
-        if (t.dataset.lrPin === '1') continue;
-        const id = t.dataset.lrId;
-        if (!id || CACHE.d.has(id) || !t.isConnected) continue;
-
-        cacheSet(id, t, t.parentNode, t.nextSibling);
-        t.parentNode.removeChild(t);
-
-        const ph = document.createElement('div');
-        ph.className = 'lr-ph';
-        ph.dataset.lrTarget = id;
-        ph.innerHTML = `<span>对话 ${i + 1}</span><button class="lr-pb">展开</button>`;
-        t.parentNode.insertBefore(ph, t.nextSibling);
-        h++;
+      if (!turns.length) {
+        updateStatus('未检测到对话内容');
+        return;
       }
-      updateStatus(`渲染 ${keep} 轮 • 隐藏 ${h} 轮`);
+
+      turns.forEach(ensureId);
+
+      const keep = clamp(Number(count) || CONFIG.defaultTurns, 1, 200);
+      const hideCount = turns.length - keep;
+      if (hideCount <= 0) {
+        STATE.hiddenCount = 0;
+        updateStatus(`全部 ${turns.length} 轮`);
+        syncStats();
+        return;
+      }
+
+      let hidden = 0;
+      for (let i = 0; i < hideCount; i++) {
+        const turn = turns[i];
+        if (!turn || turn.dataset.lrPin === '1') continue;
+        const id = turn.dataset.lrId;
+        if (!id || CACHE.d.has(id) || !turn.isConnected || !turn.parentNode) continue;
+
+        const parent = turn.parentNode;
+        const next = turn.nextSibling;
+        cacheSet(id, turn, parent, next);
+
+        turn.remove();
+
+        const ph = createPlaceholder(id, i);
+        parent.insertBefore(ph, next);
+        hidden++;
+      }
+
+      STATE.hiddenCount = hidden;
+      updateStatus(`渲染 ${keep} 轮 • 隐藏 ${hidden} 轮`);
+      syncStats();
     } finally {
       STATE.applying = false;
     }
   }
 
+  function restoreCachedTurn(id, pin = true) {
+    const c = CACHE.d.get(id);
+    if (!c?.n || !c.p?.isConnected) return false;
+
+    c.p.insertBefore(c.n, c.x);
+    if (pin) c.n.dataset.lrPin = '1';
+    return true;
+  }
+
+  function collapseTurn(id) {
+    const turn = document.querySelector(`[data-lr-id="${CSS.escape(id)}"]`);
+    if (!turn?.parentNode) return false;
+
+    cacheSet(id, turn, turn.parentNode, turn.nextSibling);
+    delete turn.dataset.lrPin;
+    turn.remove();
+    return true;
+  }
+
   function togglePh(ph) {
+    if (!ph) return;
+
     const id = ph.dataset.lrTarget;
     const expanded = ph.classList.contains('ex');
     const btn = ph.querySelector('.lr-pb');
-    
+
     if (!expanded) {
-      const c = CACHE.d.get(id);
-      if (c?.n) {
-        c.p.insertBefore(c.n, c.x);
-        c.n.dataset.lrPin = '1';
+      if (restoreCachedTurn(id, true)) {
         ph.classList.add('ex');
-        btn.textContent = '收起';
-        updateStatus('已展开');
+        if (btn) btn.textContent = '收起';
+        updateStatus('已展开该条对话');
       }
-    } else {
-      const t = document.querySelector(`[data-lr-id="${CSS.escape(id)}"]`);
-      if (t) {
-        cacheSet(id, t, t.parentNode, t.nextSibling);
-        delete t.dataset.lrPin;
-        t.parentNode.removeChild(t);
-        ph.classList.remove('ex');
-        btn.textContent = '展开';
-        updateStatus('已收起');
-      }
+      return;
+    }
+
+    if (collapseTurn(id)) {
+      ph.classList.remove('ex');
+      if (btn) btn.textContent = '展开';
+      updateStatus('已收起该条对话');
     }
   }
 
-  // 模式切换
-  let restoreTimer;
   function toSafe(reason) {
     if (!CONFIG.enabled) return;
     clearTimeout(restoreTimer);
@@ -154,79 +238,108 @@
   function scheduleRestore(reason) {
     clearTimeout(restoreTimer);
     restoreTimer = setTimeout(() => {
-      STATE.streaming ? scheduleRestore(reason) : toDefault(reason);
+      if (STATE.streaming) {
+        scheduleRestore(reason);
+      } else {
+        toDefault(reason);
+      }
     }, CONFIG.restoreDelay);
   }
 
-  // ==================== 事件监听 ====================
-  
   function setupEvents() {
-    // 发送检测
     const checkSend = (e) => {
       if (!CONFIG.enabled || !CONFIG.preSendAuto) return;
+
       let isSend = false;
       if (e.type === 'click') {
         const b = e.target.closest('button');
         if (b) {
-          const l = (b.getAttribute('aria-label')||'').toLowerCase();
-          const t = (b.dataset.testid||'').toLowerCase();
-          if (l.includes('send') || t.includes('send')) isSend = true;
+          const l = (b.getAttribute('aria-label') || '').toLowerCase();
+          const t = (b.dataset.testid || '').toLowerCase();
+          const tx = (b.textContent || '').toLowerCase();
+          if (l.includes('send') || t.includes('send') || tx.includes('send')) isSend = true;
         }
-      } else if (e.type === 'keydown' && e.key === 'Enter' && !e.shiftKey) {
+      } else if (e.type === 'keydown' && e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         const tg = e.target;
-        if (tg.tagName === 'TEXTAREA' || tg.isContentEditable) isSend = true;
+        if (tg?.tagName === 'TEXTAREA' || tg?.isContentEditable) isSend = true;
       }
-      if (isSend) { toSafe('发送前收缩'); scheduleRestore('发送完成'); }
+
+      if (isSend) {
+        toSafe('发送前收缩');
+        scheduleRestore('发送完成');
+      }
     };
+
     document.addEventListener('click', checkSend, true);
     document.addEventListener('keydown', checkSend, true);
 
-    // 卡死检测
     let last = performance.now();
     function loop(ts) {
-      if (!CONFIG.enabled || !CONFIG.freezeGuard) return;
-      if (ts - last > CONFIG.freezeThreshold && STATE.mode !== 'safe') {
-        toSafe(`卡顿 ${Math.round((ts-last)/1000)}s`);
-        scheduleRestore('已恢复');
+      if (CONFIG.enabled && CONFIG.freezeGuard && ts - last > CONFIG.freezeThreshold && STATE.mode !== 'safe') {
+        toSafe(`检测到卡顿 ${Math.round((ts - last) / 1000)}s`);
+        scheduleRestore('页面已恢复');
       }
       last = ts;
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
 
-    // DOM监听
     let timer;
     const obs = new MutationObserver(() => {
       if (!CONFIG.enabled || STATE.applying) return;
-      const n = [...document.querySelectorAll('[data-testid="conversation-turn"]')].length;
-      if (n > 0) {
+
+      const turnCount = document.querySelectorAll('[data-testid="conversation-turn"]').length;
+      if (turnCount > 0) {
         STATE.streaming = true;
         clearTimeout(timer);
         timer = setTimeout(() => {
           STATE.streaming = false;
-          applyLimit(CONFIG.defaultTurns);
-        }, 1000);
+          applyLimit(STATE.mode === 'safe' ? CONFIG.safeTurns : CONFIG.defaultTurns);
+        }, 900);
       }
     });
-    obs.observe(document.querySelector('main') || document.body, { childList: true, subtree: true });
-  }
 
-  // ==================== UI 构建 (完全重写) ====================
-  
-  function updateUI() {
-    const bar = document.getElementById('lr-bar');
-    const ind = document.getElementById('lr-ind');
-    if (!bar || !ind) return;
-    
-    ind.className = 'lr-ind';
-    if (!CONFIG.enabled) ind.classList.add('off');
-    else if (STATE.mode === 'safe') ind.classList.add('safe');
-    else ind.classList.add('on');
+    const target = document.querySelector('main') || document.body;
+    obs.observe(target, { childList: true, subtree: true });
+
+    window.addEventListener('beforeunload', saveSettings);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') saveSettings();
+    });
   }
 
   function updateStatus(txt) {
     const el = document.getElementById('lr-st');
     if (el) el.textContent = txt;
+  }
+
+  function syncStats() {
+    const stat = document.getElementById('lr-stat');
+    if (stat) stat.textContent = `隐藏 ${STATE.hiddenCount} / 缓存 ${CACHE.d.size}`;
+  }
+
+  function updateUI() {
+    const ind = document.getElementById('lr-ind');
+    const root = document.getElementById('lr-root');
+    if (!ind || !root) return;
+
+    ind.className = 'lr-ind';
+    if (!CONFIG.enabled) {
+      ind.classList.add('off');
+      root.classList.add('lr-disabled');
+    } else if (STATE.mode === 'safe') {
+      ind.classList.add('safe');
+      root.classList.remove('lr-disabled');
+    } else {
+      ind.classList.add('on');
+      root.classList.remove('lr-disabled');
+    }
+
+    root.style.setProperty('--lr-pulse', String(CONFIG.pulseIntensity));
+
+    const toggle = document.getElementById('lr-c-en');
+    if (toggle) toggle.checked = CONFIG.enabled;
+    syncStats();
   }
 
   function buildUI() {
@@ -235,195 +348,298 @@
     const css = `
       #lr-root {
         position: fixed;
-        bottom: 20px;
         right: 20px;
+        bottom: 20px;
         z-index: 99999;
-        font-family: 'Segoe UI', system-ui, sans-serif;
-        --c-on: #10b981;
+        font-family: Inter, 'Segoe UI', system-ui, sans-serif;
+        --c-on: #34d399;
         --c-safe: #f59e0b;
-        --c-off: #ef4444;
-        --bg: #ffffff;
-        --bg-panel: rgba(255,255,255,0.85);
-        --txt: #1f2937;
-        --txt2: #6b7280;
-        --border: rgba(0,0,0,0.08);
+        --c-off: #f87171;
+        --txt: #111827;
+        --txt2: #4b5563;
+        --bd: rgba(255,255,255,0.34);
+        --mica: linear-gradient(140deg, rgba(255,255,255,0.5), rgba(255,255,255,0.18));
+        --panel-shadow: 0 18px 60px rgba(0,0,0,0.2);
+        --lr-pulse: 1;
       }
       @media (prefers-color-scheme: dark) {
-        #lr-root { --bg: #1f1f1f; --bg-panel: rgba(30,30,30,0.85); --txt: #f3f4f6; --txt2: #9ca3af; --border: rgba(255,255,255,0.1); }
+        #lr-root {
+          --txt: #f3f4f6;
+          --txt2: #cbd5e1;
+          --bd: rgba(255,255,255,0.15);
+          --mica: linear-gradient(145deg, rgba(40,40,42,0.7), rgba(28,28,30,0.42));
+          --panel-shadow: 0 20px 70px rgba(0,0,0,0.45);
+        }
       }
 
-      /* 呼吸灯条按钮 */
+      .lr-mica {
+        background: var(--mica);
+        border: 1px solid var(--bd);
+        backdrop-filter: blur(18px) saturate(165%);
+        -webkit-backdrop-filter: blur(18px) saturate(165%);
+      }
+
       .lr-bar {
-        height: 44px;
-        padding: 0 20px;
-        background: var(--bg-panel);
-        backdrop-filter: blur(20px);
-        -webkit-backdrop-filter: blur(20px);
-        border-radius: 22px;
-        border: 1px solid var(--border);
-        box-shadow: 0 8px 32px rgba(0,0,0,0.12);
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 16px;
+        gap: 14px;
+        min-width: 205px;
+        height: 46px;
+        padding: 0 16px;
+        border-radius: 16px;
+        box-shadow: var(--panel-shadow);
         cursor: pointer;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         user-select: none;
-        min-width: 180px;
+        transition: transform .25s ease, box-shadow .25s ease;
       }
-      .lr-bar:hover { transform: translateY(-2px); box-shadow: 0 12px 40px rgba(0,0,0,0.18); }
-      
-      /* 左侧状态灯 */
-      .lr-s {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-      }
+      .lr-bar:hover { transform: translateY(-2px); }
+
+      .lr-s { display: flex; align-items: center; gap: 10px; }
       .lr-ind {
-        width: 32px;
-        height: 8px;
-        border-radius: 4px;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
         background: var(--c-on);
-        box-shadow: 0 0 12px var(--c-on);
-        transition: all 0.3s;
+        box-shadow: 0 0 calc(12px * var(--lr-pulse)) var(--c-on);
       }
-      .lr-ind.on { animation: glow-on 2.5s ease-in-out infinite; background: var(--c-on); }
-      .lr-ind.safe { animation: glow-safe 1s ease-in-out infinite; background: var(--c-safe); box-shadow: 0 0 12px var(--c-safe); }
-      .lr-ind.off { background: var(--c-off); opacity: 0.6; box-shadow: none; animation: none; }
-
-      @keyframes glow-on {
-        0%, 100% { opacity: 1; box-shadow: 0 0 8px var(--c-on); }
-        50% { opacity: 0.7; box-shadow: 0 0 20px var(--c-on); }
+      .lr-ind.on { animation: lr-breathe 2.6s ease-in-out infinite; }
+      .lr-ind.safe { background: var(--c-safe); box-shadow: 0 0 16px var(--c-safe); animation: lr-panic .95s ease-in-out infinite; }
+      .lr-ind.off { background: var(--c-off); animation: none; opacity: .65; box-shadow: none; }
+      @keyframes lr-breathe {
+        0%, 100% { transform: scale(1); opacity: 1; box-shadow: 0 0 calc(8px * var(--lr-pulse)) var(--c-on), 0 0 calc(20px * var(--lr-pulse)) rgba(52,211,153,.38); }
+        50% { transform: scale(1.28); opacity: .75; box-shadow: 0 0 calc(16px * var(--lr-pulse)) var(--c-on), 0 0 calc(30px * var(--lr-pulse)) rgba(52,211,153,.65); }
       }
-      @keyframes glow-safe {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.3; }
+      @keyframes lr-panic {
+        0%,100% { opacity: 1; }
+        50% { opacity: .25; transform: scale(1.3); }
       }
 
-      .lr-txt { font-size: 13px; font-weight: 600; color: var(--txt); letter-spacing: -0.02em; }
-      
-      /* 展开箭头 */
-      .lr-arr { color: var(--txt2); transition: transform 0.3s; }
+      .lr-txt { color: var(--txt); font-size: 13px; font-weight: 700; }
+      .lr-sub { color: var(--txt2); font-size: 11px; }
+      .lr-arr { color: var(--txt2); transition: transform .25s ease; }
       .lr-bar.open .lr-arr { transform: rotate(180deg); }
 
-      /* 面板 */
       .lr-p {
         position: absolute;
-        bottom: 54px;
         right: 0;
-        width: 260px;
-        background: var(--bg-panel);
-        backdrop-filter: blur(24px);
-        -webkit-backdrop-filter: blur(24px);
-        border-radius: 20px;
-        border: 1px solid var(--border);
-        box-shadow: 0 20px 60px rgba(0,0,0,0.2);
-        padding: 20px;
+        bottom: 58px;
+        width: 300px;
+        border-radius: 18px;
+        box-shadow: var(--panel-shadow);
+        padding: 16px;
         opacity: 0;
         visibility: hidden;
-        transform: translateY(10px) scale(0.96);
-        transition: all 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+        transform: translateY(12px) scale(.97);
+        transition: all .22s ease;
       }
       .lr-p.open { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
 
-      /* 面板内容 */
-      .lr-p-t { font-size: 15px; font-weight: 700; color: var(--txt); margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-      .lr-p-t svg { color: var(--c-on); }
+      .lr-title { color: var(--txt); font-size: 15px; font-weight: 800; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+      .lr-stat { font-size: 11px; color: var(--txt2); }
 
-      .lr-r { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-      .lr-l { font-size: 13px; color: var(--txt2); }
-      .lr-i { width: 50px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--txt); text-align: center; font-size: 13px; }
+      .lr-r { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 10px; }
+      .lr-l { color: var(--txt2); font-size: 12px; }
+      .lr-i {
+        width: 82px;
+        border-radius: 10px;
+        border: 1px solid var(--bd);
+        background: rgba(255,255,255,0.16);
+        color: var(--txt);
+        text-align: center;
+        padding: 6px 8px;
+      }
+      .lr-g { display: flex; gap: 8px; margin-top: 10px; }
+      .lr-b {
+        flex: 1;
+        border: 1px solid var(--bd);
+        border-radius: 10px;
+        background: rgba(255,255,255,0.16);
+        color: var(--txt);
+        font-size: 12px;
+        font-weight: 700;
+        padding: 9px;
+        cursor: pointer;
+      }
+      .lr-b:hover { background: rgba(255,255,255,0.24); }
+      .lr-op { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+      .lr-c { color: var(--txt2); font-size: 12px; display: flex; align-items: center; gap: 8px; }
+      .lr-st { margin-top: 12px; font-size: 11px; color: var(--txt2); text-align: center; padding: 8px; border-radius: 10px; background: rgba(255,255,255,.13); border: 1px solid var(--bd); }
 
-      .lr-g { display: flex; gap: 8px; margin-top: 16px; }
-      .lr-b { flex: 1; padding: 10px; border: none; border-radius: 10px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
-      .lr-bs { background: rgba(239,68,68,0.1); color: #ef4444; }
-      .lr-bs:hover { background: rgba(239,68,68,0.2); }
-      .lr-bd { background: rgba(16,163,127,0.1); color: var(--c-on); }
-      .lr-bd:hover { background: rgba(16,163,127,0.2); }
+      .lr-disabled .lr-bar,
+      .lr-disabled .lr-p { opacity: .78; }
 
-      .lr-op { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
-      .lr-c { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--txt2); cursor: pointer; }
-      
-      .lr-st { margin-top: 16px; text-align: center; font-size: 11px; color: var(--txt2); padding: 8px; background: rgba(0,0,0,0.03); border-radius: 8px; }
-
-      /* 占位符 */
-      .lr-ph { height: 40px; margin: 6px 0; background: rgba(0,0,0,0.03); border: 1px dashed var(--border); border-radius: 10px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; font-size: 12px; color: var(--txt2); transition: all 0.2s; }
-      .lr-ph:hover { background: rgba(0,0,0,0.06); }
-      .lr-ph.ex { border-color: var(--c-on); background: rgba(16,163,127,0.05); }
-      .lr-pb { padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: transparent; font-size: 11px; color: var(--txt); cursor: pointer; transition: all 0.2s; }
-      .lr-ph:hover .lr-pb { background: var(--c-on); color: white; border-color: var(--c-on); }
+      .lr-ph {
+        height: 40px;
+        margin: 6px 0;
+        padding: 0 12px;
+        border-radius: 10px;
+        border: 1px dashed rgba(148,163,184,.45);
+        background: rgba(148,163,184,.08);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12px;
+        color: #64748b;
+      }
+      .lr-ph.ex { border-color: rgba(52,211,153,.65); background: rgba(52,211,153,.13); }
+      .lr-pb {
+        border-radius: 8px;
+        border: 1px solid rgba(148,163,184,.4);
+        background: rgba(255,255,255,.3);
+        color: #334155;
+        font-size: 11px;
+        padding: 4px 10px;
+        cursor: pointer;
+      }
     `;
 
-    const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s);
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
 
     const root = document.createElement('div');
     root.id = 'lr-root';
     root.innerHTML = `
-      <div class="lr-p" id="lr-panel">
-        <div class="lr-p-t"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> Limit Render</div>
-        <div class="lr-r"><span class="lr-l">默认轮数</span><input type="number" class="lr-i" id="lr-d" value="${CONFIG.defaultTurns}"></div>
-        <div class="lr-r"><span class="lr-l">安全轮数</span><input type="number" class="lr-i" id="lr-s" value="${CONFIG.safeTurns}"></div>
+      <div class="lr-p lr-mica" id="lr-panel">
+        <div class="lr-title">
+          <span>Limit Render</span>
+          <span class="lr-stat" id="lr-stat">隐藏 0 / 缓存 0</span>
+        </div>
+        <div class="lr-r"><span class="lr-l">默认轮数</span><input type="number" class="lr-i" id="lr-d" min="1" max="200" value="${CONFIG.defaultTurns}"></div>
+        <div class="lr-r"><span class="lr-l">安全轮数</span><input type="number" class="lr-i" id="lr-s" min="1" max="50" value="${CONFIG.safeTurns}"></div>
+        <div class="lr-r"><span class="lr-l">恢复延迟(ms)</span><input type="number" class="lr-i" id="lr-rd" min="200" max="10000" value="${CONFIG.restoreDelay}"></div>
+        <div class="lr-r"><span class="lr-l">呼吸强度(0.2-2)</span><input type="number" step="0.1" class="lr-i" id="lr-pi" min="0.2" max="2" value="${CONFIG.pulseIntensity}"></div>
         <div class="lr-g">
-          <button class="lr-b lr-bs" id="lr-btn-s">收缩</button>
-          <button class="lr-b lr-bd" id="lr-btn-r">恢复</button>
+          <button class="lr-b" id="lr-btn-s">安全收缩</button>
+          <button class="lr-b" id="lr-btn-r">恢复默认</button>
         </div>
         <div class="lr-op">
-          <label class="lr-c"><input type="checkbox" id="lr-c-p" ${CONFIG.preSendAuto?'checked':''}> 发送前收缩</label>
-          <label class="lr-c"><input type="checkbox" id="lr-c-f" ${CONFIG.freezeGuard?'checked':''}> 防卡死</label>
+          <label class="lr-c"><input type="checkbox" id="lr-c-en" ${CONFIG.enabled ? 'checked' : ''}> 启用 Limit Render</label>
+          <label class="lr-c"><input type="checkbox" id="lr-c-p" ${CONFIG.preSendAuto ? 'checked' : ''}> 发送前自动收缩</label>
+          <label class="lr-c"><input type="checkbox" id="lr-c-f" ${CONFIG.freezeGuard ? 'checked' : ''}> 启用防卡死守护</label>
         </div>
         <div class="lr-st" id="lr-st">就绪</div>
       </div>
-      <div class="lr-bar" id="lr-bar">
+      <div class="lr-bar lr-mica" id="lr-bar">
         <div class="lr-s">
           <div class="lr-ind on" id="lr-ind"></div>
-          <span class="lr-txt">Limit Render</span>
+          <div>
+            <div class="lr-txt">Limit Render</div>
+            <div class="lr-sub" id="lr-mode">default</div>
+          </div>
         </div>
         <svg class="lr-arr" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
       </div>
     `;
-    document.body.appendChild(root);
 
-    // 事件绑定
+    document.body.appendChild(root);
+    STATE.mounted = true;
+
     const bar = document.getElementById('lr-bar');
-    const pan = document.getElementById('lr-panel');
-    
-    bar.onclick = () => {
+    const panel = document.getElementById('lr-panel');
+
+    bar?.addEventListener('click', () => {
       STATE.expanded = !STATE.expanded;
       bar.classList.toggle('open', STATE.expanded);
-      pan.classList.toggle('open', STATE.expanded);
-    };
-    
-    document.addEventListener('click', e => {
-      if (STATE.expanded && !e.target.closest('#lr-root')) {
+      panel.classList.toggle('open', STATE.expanded);
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!STATE.expanded) return;
+      if (!e.target.closest('#lr-root')) {
         STATE.expanded = false;
         bar.classList.remove('open');
-        pan.classList.remove('open');
+        panel.classList.remove('open');
       }
     });
 
-    document.getElementById('lr-d').onchange = e => { CONFIG.defaultTurns = +e.target.value || 15; applyLimit(CONFIG.defaultTurns); };
-    document.getElementById('lr-s').onchange = e => { CONFIG.safeTurns = +e.target.value || 6; };
-    document.getElementById('lr-btn-s').onclick = () => toSafe('手动');
-    document.getElementById('lr-btn-r').onclick = () => toDefault('手动');
-    document.getElementById('lr-c-p').onchange = e => CONFIG.preSendAuto = e.target.checked;
-    document.getElementById('lr-c-f').onchange = e => CONFIG.freezeGuard = e.target.checked;
+    document.getElementById('lr-d')?.addEventListener('change', (e) => {
+      CONFIG.defaultTurns = clamp(Number(e.target.value) || 15, 1, 200);
+      saveSettings();
+      applyLimit(CONFIG.defaultTurns);
+    });
 
-    document.addEventListener('click', e => {
-      const b = e.target.closest('.lr-pb');
-      if (b) togglePh(b.closest('.lr-ph'));
+    document.getElementById('lr-s')?.addEventListener('change', (e) => {
+      CONFIG.safeTurns = clamp(Number(e.target.value) || 6, 1, 50);
+      saveSettings();
+    });
+
+    document.getElementById('lr-rd')?.addEventListener('change', (e) => {
+      CONFIG.restoreDelay = clamp(Number(e.target.value) || 1500, 200, 10000);
+      saveSettings();
+    });
+
+    document.getElementById('lr-pi')?.addEventListener('change', (e) => {
+      CONFIG.pulseIntensity = clamp(Number(e.target.value) || 1, 0.2, 2);
+      saveSettings();
+      updateUI();
+    });
+
+    document.getElementById('lr-btn-s')?.addEventListener('click', () => toSafe('手动触发'));
+    document.getElementById('lr-btn-r')?.addEventListener('click', () => toDefault('手动触发'));
+
+    document.getElementById('lr-c-en')?.addEventListener('change', (e) => {
+      CONFIG.enabled = !!e.target.checked;
+      if (!CONFIG.enabled) {
+        STATE.mode = 'disabled';
+        updateStatus('功能已关闭');
+      } else {
+        toDefault('已重新启用');
+      }
+      saveSettings();
+      updateUI();
+    });
+
+    document.getElementById('lr-c-p')?.addEventListener('change', (e) => {
+      CONFIG.preSendAuto = !!e.target.checked;
+      saveSettings();
+    });
+
+    document.getElementById('lr-c-f')?.addEventListener('change', (e) => {
+      CONFIG.freezeGuard = !!e.target.checked;
+      saveSettings();
+    });
+
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('.lr-pb');
+      if (btn) togglePh(btn.closest('.lr-ph'));
     });
   }
 
-  // ==================== 初始化 ====================
-  
-  function init() {
-    buildUI();
-    setupEvents();
-    setTimeout(() => {
-      if (CONFIG.enabled) applyLimit(CONFIG.defaultTurns);
-      updateUI();
-    }, 1200);
+  function refreshModeLabel() {
+    const modeEl = document.getElementById('lr-mode');
+    if (modeEl) modeEl.textContent = STATE.mode;
   }
 
-  document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', init) : init();
-})()
+  function init() {
+    loadSettings();
+    buildUI();
+    setupEvents();
+
+    setTimeout(() => {
+      if (CONFIG.enabled) {
+        STATE.mode = 'default';
+        applyLimit(CONFIG.defaultTurns);
+      } else {
+        STATE.mode = 'disabled';
+      }
+      refreshModeLabel();
+      updateUI();
+      updateStatus('就绪');
+    }, 1200);
+
+    const stateTimer = setInterval(() => {
+      if (!STATE.mounted || !document.getElementById('lr-root')) {
+        clearInterval(stateTimer);
+        return;
+      }
+      refreshModeLabel();
+      syncStats();
+    }, 350);
+  }
+
+  document.readyState === 'loading'
+    ? document.addEventListener('DOMContentLoaded', init)
+    : init();
+})();
